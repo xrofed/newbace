@@ -64,6 +64,53 @@ async function attachChapterCounts(mangas) {
     }));
 }
 
+// Helper: Chapter Count + Last Chapter (untuk listing)
+async function attachChapterInfo(mangas) {
+    if (!mangas || mangas.length === 0) return [];
+
+    const mangaIds = mangas.map(m => m._id);
+
+    const [counts, latestChapters] = await Promise.all([
+        Chapter.aggregate([
+            { $match: { manga_id: { $in: mangaIds } } },
+            { $group: { _id: "$manga_id", count: { $sum: 1 } } }
+        ]),
+        Chapter.aggregate([
+            { $match: { manga_id: { $in: mangaIds } } },
+            { $sort: { manga_id: 1, chapter_index: -1, createdAt: -1 } },
+            {
+                $group: {
+                    _id: "$manga_id",
+                    chapter: {
+                        $first: {
+                            title: "$title",
+                            slug: "$slug",
+                            chapter_index: "$chapter_index",
+                            createdAt: "$createdAt"
+                        }
+                    }
+                }
+            }
+        ])
+    ]);
+
+    const countMap = {};
+    counts.forEach(c => {
+        countMap[c._id.toString()] = c.count;
+    });
+
+    const chapterMap = {};
+    latestChapters.forEach(c => {
+        chapterMap[c._id.toString()] = c.chapter || null;
+    });
+
+    return mangas.map(m => ({
+        ...m,
+        chapter_count: countMap[m._id.toString()] || 0,
+        last_chapter: chapterMap[m._id.toString()] || null
+    }));
+}
+
 // ==========================================
 // 1. HOME & LISTING ENDPOINTS
 // ==========================================
@@ -151,22 +198,71 @@ router.get('/home', async (req, res) => {
     }
 });
 
-// GET /api/manga-list
+// ==========================================
+// 1. UTAMA: ADVANCED FILTER & SEARCH (GET /manga)
+// ==========================================
 router.get('/manga-list', async (req, res) => {
     try {
         const { page, limit, skip } = getPaginationParams(req);
+        // 1. Tambahkan 'order' dalam destructuring query
+        const { q, status, type, genre, order } = req.query;
 
-        const [total, mangasRaw] = await Promise.all([
-            Manga.countDocuments(),
-            Manga.find()
-                .select('title slug thumb metadata.rating metadata.status metadata.type')
-                .sort({ title: 1 }) // A-Z
-                .skip(skip)
-                .limit(limit)
-                .lean()
-        ]);
+        // Bangun Query Object Dinamis
+        let query = {};
+
+        // Filter Search (Title)
+        if (q) {
+            query.title = { $regex: q, $options: 'i' };
+        }
+
+        // Filter Status (Publishing/Finished)
+        if (status && status !== 'all') {
+            query['metadata.status'] = { $regex: new RegExp(`^${status}$`, 'i') };
+        }
+
+        // Filter Type (Manga/Manhwa/Doujinshi)
+        if (type && type !== 'all') {
+            query['metadata.type'] = { $regex: new RegExp(`^${type}$`, 'i') };
+        }
+
+        // Filter Genre
+        if (genre && genre !== 'all') {
+            const cleanGenre = genre.replace(/-/g, '[\\s\\-]');
+            query.tags = { $regex: new RegExp(cleanGenre, 'i') };
+        }
+
+        // --- 2. LOGIKA SORTING BARU ---
+        let sortOption = { updatedAt: -1 }; // Default: Terbaru
+
+        switch (order) {
+            case 'oldest':
+                sortOption = { updatedAt: 1 }; // Terlama (Ascending)
+                break;
+            case 'popular':
+                sortOption = { views: -1 }; // Terpopuler (Views terbanyak)
+                break;
+            case 'az':
+                sortOption = { title: 1 }; // Abjad A-Z
+                break;
+            case 'za':
+                sortOption = { title: -1 }; // Abjad Z-A
+                break;
+            default:
+                sortOption = { updatedAt: -1 }; // Terbaru (Default)
+        }
+
+        // Eksekusi Query
+        const total = await Manga.countDocuments(query);
         
-        const mangas = await attachChapterCounts(mangasRaw);
+        const mangasRaw = await Manga.find(query)
+            .select('title slug thumb metadata views rating status type tags updatedAt') 
+            .sort(sortOption) // 3. Gunakan variabel sortOption disini
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        // Attach info tambahan (Chapter Count & Last Chapter)
+        const mangas = await attachChapterInfo(mangasRaw);
 
         successResponse(res, mangas, {
             currentPage: page,
@@ -174,6 +270,7 @@ router.get('/manga-list', async (req, res) => {
             totalItems: total,
             perPage: limit
         });
+
     } catch (err) {
         errorResponse(res, err.message);
     }
